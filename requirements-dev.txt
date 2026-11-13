@@ -1,0 +1,4 @@
+# 仅测试环境需要（生产镜像 requirements.txt 不含测试依赖）
+-r requirements.txt
+pytest==9.2.0
+pytest-asyncio==1.5.0

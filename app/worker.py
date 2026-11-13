@@ -1,11 +1,14 @@
 """采集进程。
 
 关键约束（两进程共用同一 SQLite 库）：
-1. 同源全局在途请求 <= 2；同一源相邻请求“开始”时刻至少间隔 1 秒。
+1. 同源全局在途请求 <= 2；同一源相邻请求“实际开始”时刻至少间隔 1 秒。
+   间隔不在认领阶段裁决，而由发送闸门 _wait_to_send 在真正发包前预留
+   last_started_at——时间戳在写锁内读取，等锁耗时不会污染间隔判定。
 2. 收到 429：以“收到响应的时刻”为起点，按 Retry-After 整数秒设置该源冷却；
-   后续任何响应只会延长、不会缩短冷却；冷却期间其他源照常采集。
+   已认领但尚未发送的条目同样在发送闸门前停下等待；后续任何响应只会延长、
+   不会缩短冷却；冷却按源隔离，其他源照常采集。
 3. 429 项自动重试（回 pending）；其他 HTTP 错误或字段不符 -> 该项失败。
-4. 等待网络 / 冷却期间不持有任何数据库写事务，查询始终可响应。
+4. 等待网络 / 冷却 / 间隔期间不持有任何数据库写事务，查询始终可响应。
 5. 进程退出：在途项回 pending、释放名额；重启后自动接续，成功项不重复保存。
 6. 只回收心跳过期进程的名额，绝不动存活进程；冷却落在数据库里，重启不绕过。
 """
@@ -24,21 +27,27 @@ from . import config, db
 
 
 class Worker:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        transport: httpx.AsyncBaseTransport | None = None,
+        hostname: str | None = None,
+    ) -> None:
         self.worker_pk: int | None = None
-        self.hostname = os.getenv("HOSTNAME", f"worker-{os.getpid()}")
+        self.hostname = hostname or os.getenv("HOSTNAME", f"worker-{os.getpid()}")
         self.conn: aiosqlite.Connection | None = None
         self.client: httpx.AsyncClient | None = None
+        # 测试可注入脚本化 transport；生产为 None，走真实网络
+        self._transport = transport
         self.write_lock = asyncio.Lock()
         self.sem = asyncio.Semaphore(config.WORKER_CONCURRENCY)
         self.tasks: set[asyncio.Task] = set()
         self.shutdown_event = asyncio.Event()
         # 本进程的内存提示，减少无效轮询；数据库状态才是唯一权威
         self.mem_cooldown: dict[str, float] = {}
-        self.mem_gap_hint: dict[str, float] = {}
 
     # ------------------------------------------------------------------ 生命周期
-    async def run(self) -> None:
+    async def start(self) -> None:
+        """打开数据库、注册 worker、构造 HTTP 客户端（run 的前半段，便于测试复用）。"""
         self.conn = await db.connect()
         await db.init_db(self.conn)
         now = time.time()
@@ -49,11 +58,16 @@ class Worker:
         )
         self.worker_pk = cur.lastrowid
 
-        self.client = httpx.AsyncClient(timeout=config.HTTP_TIMEOUT_SECONDS)
+        self.client = httpx.AsyncClient(
+            timeout=config.HTTP_TIMEOUT_SECONDS, transport=self._transport
+        )
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self.shutdown_event.set)
+
+    async def run(self) -> None:
+        await self.start()
 
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
@@ -95,7 +109,6 @@ class Worker:
     async def _spawn_work(self) -> bool:
         """每个轮询周期为每个“当前可发起请求”的源至多启动一个请求。"""
         assert self.conn is not None
-        now = time.time()
         async with self.write_lock:
             rows = await db.fetchall(self.conn, 
                 "SELECT source_base, last_started_at, cooldown_until FROM source_states"
@@ -117,16 +130,22 @@ class Worker:
             state = await self._acquire(source)
             if state is None:
                 continue
-            task = asyncio.create_task(self._process_item(source, *state))
+            # 认领时刻（state 第 4 项）仅用于租约；实际发送时刻以发送闸门为准
+            item_id, station_id, date, _ = state
+            task = asyncio.create_task(
+                self._process_item(source, item_id, station_id, date)
+            )
             self.tasks.add(task)
             launched = True
         return launched
 
     # ------------------------------------------------------------- 名额/限速获取
     async def _acquire(self, source: str):
-        """原子地检查冷却/在途/1秒间隔并认领一个 pending 项。
+        """原子地检查冷却/在途名额并认领一个 pending 项。
 
-        返回 (item_id, station_id, date, request_started_at)；不可发起返回 None。
+        返回 (item_id, station_id, date)；不可发起返回 None。
+        1 秒间隔不在这里裁决：此时请求尚未真正发送，等写锁的耗时不能计入
+        间隔；间隔由 _wait_to_send 在发包前的短事务内用新鲜时间戳预留。
         整个判定在一个 BEGIN IMMEDIATE 短事务内完成，跨进程串行化。
         注意：事务的每个出口都必须 COMMIT 或 ROLLBACK，绝不能在事务内裸 return。
         """
@@ -134,9 +153,6 @@ class Worker:
         now = time.time()
         hint = self.mem_cooldown.get(source)
         if hint and hint > now:
-            return None
-        gap_hint = self.mem_gap_hint.get(source)
-        if gap_hint and gap_hint > now:
             return None
 
         async with self.write_lock:
@@ -146,11 +162,10 @@ class Worker:
                 return None
             try:
                 row = await db.fetchone(self.conn,
-                    "SELECT last_started_at, cooldown_until FROM source_states "
+                    "SELECT cooldown_until FROM source_states "
                     "WHERE source_base = ?",
                     (source,),
                 )
-                last_started = row["last_started_at"] if row else None
                 cooldown_until = row["cooldown_until"] if row else None
 
                 reason: str | None = None
@@ -164,14 +179,6 @@ class Worker:
                     )
                     if inflight["c"] >= config.MAX_INFLIGHT_PER_SOURCE:
                         reason = "inflight_full"
-                    elif (
-                        last_started is not None
-                        and now - last_started < config.MIN_REQUEST_GAP_SECONDS
-                    ):
-                        self.mem_gap_hint[source] = (
-                            last_started + config.MIN_REQUEST_GAP_SECONDS
-                        )
-                        reason = "gap"
 
                 item = None
                 if reason is None:
@@ -201,11 +208,11 @@ class Worker:
                         "VALUES (?, ?, ?, ?)",
                         (source, item["id"], self.worker_pk, now),
                     )
+                    # 确保源状态行存在；不写 last_started_at——它只记录真正发包时刻
                     await self.conn.execute(
-                        "INSERT INTO source_states(source_base, last_started_at, cooldown_until) "
-                        "VALUES (?, ?, NULL) "
-                        "ON CONFLICT(source_base) DO UPDATE SET last_started_at=excluded.last_started_at",
-                        (source, now),
+                        "INSERT INTO source_states(source_base) VALUES (?) "
+                        "ON CONFLICT(source_base) DO NOTHING",
+                        (source,),
                     )
                 # 唯一的事务出口：无论是否认领都提交（只读判定也需结束事务）
                 await self.conn.execute("COMMIT")
@@ -217,13 +224,101 @@ class Worker:
             return None
         return item["id"], item["station_id"], item["date"], now
 
+    # ------------------------------------------------------------- 发送闸门
+    async def _wait_to_send(self, source: str) -> bool:
+        """发包前的闸门：通过冷却与 1 秒间隔检查，并预留本次请求开始时刻。
+
+        - 冷却等待在事务外进行（只读查询，不占写锁），按源隔离，可被退出信号
+          打断；冷却期间其他源的采集与 API 查询都不会被堵住。
+        - 最终裁决在 BEGIN IMMEDIATE 短事务内、用锁内读取的新鲜时间戳完成，
+          因此等锁耗时不会让实际开始间隔小于 MIN_REQUEST_GAP_SECONDS。
+        - 已认领但尚未发送的条目若撞上 429 冷却，会在这里等待冷却结束，
+          不会绕过冷却发出。
+        返回 False 表示退出信号触发，调用方应放弃发送（条目由退出逻辑回收）。
+        """
+        assert self.conn is not None
+        while not self.shutdown_event.is_set():
+            now = time.time()
+            row = await db.fetchone(
+                self.conn,
+                "SELECT last_started_at, cooldown_until FROM source_states "
+                "WHERE source_base = ?",
+                (source,),
+            )
+            cooldown_until = row["cooldown_until"] if row else None
+            last_started = row["last_started_at"] if row else None
+
+            wait_until = 0.0
+            if cooldown_until and cooldown_until > now:
+                wait_until = max(wait_until, cooldown_until)
+            if last_started is not None:
+                gap_ready = last_started + config.MIN_REQUEST_GAP_SECONDS
+                if gap_ready > now:
+                    wait_until = max(wait_until, gap_ready)
+            if wait_until > now:
+                # 无事务等待：其他连接的写事务、其他源的请求均不受影响
+                try:
+                    await asyncio.wait_for(
+                        self.shutdown_event.wait(), timeout=wait_until - now
+                    )
+                    return False  # shutdown 被置位
+                except asyncio.TimeoutError:
+                    continue  # 醒来后重新读取，防止等待期间冷却被延长
+
+            # 最终裁决：短事务 + 锁内新鲜时间戳，跨进程串行化预留
+            async with self.write_lock:
+                txn_started = False
+                try:
+                    try:
+                        await self.conn.execute("BEGIN IMMEDIATE")
+                        txn_started = True
+                    except aiosqlite.OperationalError:
+                        # 写锁被其他连接占用：短暂退避后重判（锁外无事务）
+                        await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+                        continue
+                    fresh_now = time.time()
+                    state = await db.fetchone(
+                        self.conn,
+                        "SELECT last_started_at, cooldown_until FROM source_states "
+                        "WHERE source_base = ?",
+                        (source,),
+                    )
+                    cooldown_until = state["cooldown_until"] if state else None
+                    last_started = state["last_started_at"] if state else None
+                    blocked = (cooldown_until and cooldown_until > fresh_now) or (
+                        last_started is not None
+                        and fresh_now - last_started < config.MIN_REQUEST_GAP_SECONDS
+                    )
+                    if blocked:
+                        # 等锁期间状态被其他进程改变（如收到新的 429 冷却）
+                        await self.conn.execute("ROLLBACK")
+                        txn_started = False
+                        continue
+                    await self.conn.execute(
+                        "UPDATE source_states SET last_started_at=? "
+                        "WHERE source_base=?",
+                        (fresh_now, source),
+                    )
+                    await self.conn.execute("COMMIT")
+                    txn_started = False
+                    return True
+                finally:
+                    if txn_started:
+                        with contextlib.suppress(aiosqlite.OperationalError):
+                            await self.conn.execute("ROLLBACK")
+
     # ------------------------------------------------------------------ 单条采集
     async def _process_item(
-        self, source: str, item_id: int, station_id: str, date: str, started_at: float
+        self, source: str, item_id: int, station_id: str, date: str
     ) -> None:
         async with self.sem:
             try:
                 assert self.client is not None
+                # 发送闸门：已认领的条目在真正发包前仍须通过冷却与 1 秒间隔检查。
+                # 等待期间不持有任何数据库写事务；退出信号触发则放弃发送，
+                # 条目由 _shutdown/租约回收逻辑安全回退到 pending。
+                if not await self._wait_to_send(source):
+                    return
                 url = source.rstrip("/") + "/daily"
                 # 等待网络期间不持有任何数据库事务
                 resp = await self.client.get(
@@ -234,7 +329,7 @@ class Worker:
                 if resp.status_code == 429:
                     retry_after = self._parse_retry_after(resp)
                     await self._on_rate_limited(
-                        source, item_id, received_at, retry_after, started_at
+                        source, item_id, received_at, retry_after
                     )
                     return
 
@@ -243,7 +338,6 @@ class Worker:
                         item_id,
                         f"HTTP_{resp.status_code}",
                         f"上游返回 HTTP {resp.status_code}",
-                        started_at,
                     )
                     return
 
@@ -251,25 +345,25 @@ class Worker:
                     payload = resp.json()
                 except Exception as exc:
                     await self._finish_failed(
-                        item_id, "BAD_JSON", f"响应不是合法 JSON: {exc}", started_at
+                        item_id, "BAD_JSON", f"响应不是合法 JSON: {exc}"
                     )
                     return
 
                 error = self._validate(payload, station_id, date)
                 if error:
                     await self._finish_failed(
-                        item_id, "FIELD_MISMATCH", error, started_at
+                        item_id, "FIELD_MISMATCH", error
                     )
                     return
 
-                await self._finish_succeeded(item_id, float(payload["precipitation"]), started_at)
+                await self._finish_succeeded(item_id, float(payload["precipitation"]))
             except httpx.HTTPError as exc:
-                await self._finish_failed(item_id, "NETWORK_ERROR", str(exc), started_at)
+                await self._finish_failed(item_id, "NETWORK_ERROR", str(exc))
             except asyncio.CancelledError:
                 # 优雅退出路径：shutdown() 会统一回滚，这里不做任何写操作
                 raise
             except Exception as exc:  # 防御性兜底，保证 worker 不挂
-                await self._finish_failed(item_id, "WORKER_ERROR", repr(exc), started_at)
+                await self._finish_failed(item_id, "WORKER_ERROR", repr(exc))
 
     @staticmethod
     def _parse_retry_after(resp: httpx.Response) -> int:
@@ -303,7 +397,6 @@ class Worker:
         item_id: int,
         received_at: float,
         retry_after: int,
-        started_at: float,
     ) -> None:
         if self.shutdown_event.is_set():
             return
@@ -343,8 +436,8 @@ class Worker:
                 )
                 if cur.rowcount:
                     await self.conn.execute(
-                        "DELETE FROM inflight_slots WHERE item_id=? AND started_at=?",
-                        (item_id, started_at),
+                        "DELETE FROM inflight_slots WHERE item_id=?",
+                        (item_id,),
                     )
                 await self.conn.execute("COMMIT")
             except Exception:
@@ -354,7 +447,7 @@ class Worker:
         self.mem_cooldown[source] = effective
 
     async def _finish_succeeded(
-        self, item_id: int, precipitation: float, started_at: float
+        self, item_id: int, precipitation: float
     ) -> None:
         if self.shutdown_event.is_set():
             return
@@ -374,8 +467,8 @@ class Worker:
                 )
                 if cur.rowcount:
                     await self.conn.execute(
-                        "DELETE FROM inflight_slots WHERE item_id=? AND started_at=?",
-                        (item_id, started_at),
+                        "DELETE FROM inflight_slots WHERE item_id=?",
+                        (item_id,),
                     )
                 await self.conn.execute("COMMIT")
             except Exception:
@@ -384,7 +477,7 @@ class Worker:
                 raise
 
     async def _finish_failed(
-        self, item_id: int, code: str, message: str, started_at: float
+        self, item_id: int, code: str, message: str
     ) -> None:
         if self.shutdown_event.is_set():
             return
@@ -403,8 +496,8 @@ class Worker:
                 )
                 if cur.rowcount:
                     await self.conn.execute(
-                        "DELETE FROM inflight_slots WHERE item_id=? AND started_at=?",
-                        (item_id, started_at),
+                        "DELETE FROM inflight_slots WHERE item_id=?",
+                        (item_id,),
                     )
                 await self.conn.execute("COMMIT")
             except Exception:
